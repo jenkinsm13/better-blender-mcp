@@ -38,8 +38,9 @@ def register(mcp) -> None:
         colls = _collection_hierarchy(scene.collection)
 
         active_name = None
-        if bpy.context.active_object is not None:
-            active_name = bpy.context.active_object.name
+        active = bpy.context.view_layer.objects.active
+        if active is not None:
+            active_name = active.name
 
         tile_info = tile_grid_summary(all_names)
 

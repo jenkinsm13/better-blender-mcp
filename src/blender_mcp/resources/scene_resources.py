@@ -20,8 +20,8 @@ def register(mcp) -> None:
             "name": scene.name,
             "object_count": len(scene.objects),
             "objects": objects,
-            "active_object": scene.objects.active.name
-            if scene.objects.active
+            "active_object": bpy.context.view_layer.objects.active.name
+            if bpy.context.view_layer.objects.active
             else None,
             "frame_range": [scene.frame_start, scene.frame_end],
         }

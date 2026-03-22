@@ -11,14 +11,31 @@ _HEADLESS_ERROR = error(
 _VALID_SHADING_MODES = {"SOLID", "WIREFRAME", "MATERIAL", "RENDERED"}
 
 
-def _get_3d_view_space():
-    """Return the first SpaceView3D found across all areas, or None."""
-    for area in bpy.context.screen.areas:
-        if area.type == "VIEW_3D":
-            for space in area.spaces:
-                if space.type == "VIEW_3D":
-                    return area, space
-    return None, None
+def _get_3d_view_context():
+    """Return (window, area, space, region) for the first VIEW_3D found, or Nones.
+
+    Works from timer context where bpy.context.screen is None by walking
+    bpy.context.window_manager.windows instead.
+    """
+    for window in bpy.context.window_manager.windows:
+        screen = window.screen
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type == "VIEW_3D":
+                space = None
+                region = None
+                for s in area.spaces:
+                    if s.type == "VIEW_3D":
+                        space = s
+                        break
+                for r in area.regions:
+                    if r.type == "WINDOW":
+                        region = r
+                        break
+                if space:
+                    return window, area, space, region
+    return None, None, None, None
 
 
 def register(mcp) -> None:
@@ -31,14 +48,9 @@ def register(mcp) -> None:
         Returns the absolute path of the saved file.
         resolution sets the longer edge; aspect ratio is preserved from the scene render settings.
         """
-        if not bpy.context.screen:
-            return _HEADLESS_ERROR
-
-        area, space = _get_3d_view_space()
+        window, area, space, region = _get_3d_view_context()
         if area is None:
-            return error(
-                "InvalidOperation", "No VIEW_3D area found in the current screen."
-            )
+            return _HEADLESS_ERROR
 
         # Save scene render resolution so we can restore it
         scene = bpy.context.scene
@@ -52,7 +64,7 @@ def register(mcp) -> None:
         scene.render.resolution_percentage = 100
 
         try:
-            with bpy.context.temp_override(area=area):
+            with bpy.context.temp_override(window=window, area=area, region=region):
                 bpy.ops.screen.screenshot_area(filepath=output_path)
         except Exception as exc:
             return error("CaptureError", str(exc))
@@ -69,9 +81,6 @@ def register(mcp) -> None:
 
         mode must be one of: SOLID, WIREFRAME, MATERIAL, RENDERED.
         """
-        if not bpy.context.screen:
-            return _HEADLESS_ERROR
-
         mode = mode.upper()
         if mode not in _VALID_SHADING_MODES:
             return error(
@@ -79,11 +88,9 @@ def register(mcp) -> None:
                 f"mode must be one of {sorted(_VALID_SHADING_MODES)}, got '{mode}'.",
             )
 
-        area, space = _get_3d_view_space()
+        window, area, space, region = _get_3d_view_context()
         if area is None:
-            return error(
-                "InvalidOperation", "No VIEW_3D area found in the current screen."
-            )
+            return _HEADLESS_ERROR
 
         space.shading.type = mode
         return success(mode=mode)
@@ -95,14 +102,9 @@ def register(mcp) -> None:
         If object_names is None or empty, all scene objects are framed.
         Returns the count of objects that were selected and framed.
         """
-        if not bpy.context.screen:
-            return _HEADLESS_ERROR
-
-        area, space = _get_3d_view_space()
+        window, area, space, region = _get_3d_view_context()
         if area is None:
-            return error(
-                "InvalidOperation", "No VIEW_3D area found in the current screen."
-            )
+            return _HEADLESS_ERROR
 
         # Deselect all
         for obj in bpy.context.scene.objects:
@@ -121,18 +123,14 @@ def register(mcp) -> None:
                 obj.select_set(True)
             framed_count = len(bpy.context.scene.objects)
 
-        region = None
-        for r in area.regions:
-            if r.type == "WINDOW":
-                region = r
-                break
-
         if region is None:
             return error(
                 "InvalidOperation", "Could not find WINDOW region in VIEW_3D area."
             )
 
-        with bpy.context.temp_override(area=area, region=region, space_data=space):
+        with bpy.context.temp_override(
+            window=window, area=area, region=region, space_data=space
+        ):
             bpy.ops.view3d.view_selected()
 
         return success(framed_count=framed_count)
@@ -148,14 +146,9 @@ def register(mcp) -> None:
         Only properties passed as non-None are changed.
         Returns the resulting state of all three overlay flags.
         """
-        if not bpy.context.screen:
-            return _HEADLESS_ERROR
-
-        area, space = _get_3d_view_space()
+        window, area, space, region = _get_3d_view_context()
         if area is None:
-            return error(
-                "InvalidOperation", "No VIEW_3D area found in the current screen."
-            )
+            return _HEADLESS_ERROR
 
         overlay = space.overlay
         if wireframe is not None:

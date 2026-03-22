@@ -13,7 +13,8 @@ from blender_mcp.utils.mesh_utils import bounding_box, check_tile_transform
 
 def _ensure_object_mode():
     """Return to object mode if currently in edit mode."""
-    if bpy.context.active_object and bpy.context.active_object.mode != "OBJECT":
+    active = bpy.context.view_layer.objects.active
+    if active and active.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
 
 
