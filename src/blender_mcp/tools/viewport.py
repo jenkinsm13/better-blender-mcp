@@ -123,16 +123,12 @@ def register(mcp) -> None:
     def capture_viewport_4pack(output_path: str, resolution: int = 2048) -> dict:
         """Capture Top, Front, Right, and Perspective views stitched into a 2x2 grid.
 
-        Each quadrant is rendered at resolution/2 × resolution/2 using OpenGL
-        viewport rendering, then combined into a single PNG.  The perspective
-        quadrant preserves the user's current view angle.
+        Each quadrant is rendered at resolution/2 using OpenGL viewport
+        rendering, then combined into a single PNG.  The perspective quadrant
+        preserves the user's current view angle.
 
-        Layout:
-            ┌───────┬───────┐
-            │  TOP  │ FRONT │
-            ├───────┼───────┤
-            │ RIGHT │ PERSP │
-            └───────┴───────┘
+        Layout: TOP (top-left), FRONT (top-right), RIGHT (bottom-left),
+        PERSPECTIVE (bottom-right).
         """
         window, area, space, region = _get_3d_view_context()
         if area is None:
