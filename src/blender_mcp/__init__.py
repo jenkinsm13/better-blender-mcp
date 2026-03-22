@@ -18,6 +18,11 @@ _server_thread = None
 _queue = None
 
 
+def get_queue():
+    """Return the active ExecutionQueue, or None if server is not running."""
+    return _queue
+
+
 def _timer_callback():
     """Drain execution queue on main thread. Called by bpy.app.timers."""
     if _queue is not None:

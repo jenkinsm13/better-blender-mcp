@@ -1,5 +1,6 @@
 """Viewport tools for Blender MCP."""
 
+import os
 import bpy
 from blender_mcp.utils.responses import success, error
 
@@ -38,56 +39,123 @@ def _get_3d_view_context():
     return None, None, None, None
 
 
+def _make_capture_pending(output_path: str, resolution: int, area):
+    """Return a PendingResult that captures the viewport via a POST_PIXEL draw handler.
+
+    Called on the main thread (from queue.drain).  The draw handler fires during
+    the very next Blender draw cycle when GPU context IS active, reads the
+    framebuffer, writes a PNG, then resolves the future the HTTP thread is
+    waiting on.
+    """
+    from blender_mcp.queue import PendingResult
+
+    def setup_capture(future) -> None:
+        _done = [False]  # guard: only fire once
+
+        def draw_callback() -> None:
+            if _done[0]:
+                return
+            _done[0] = True
+
+            # Remove handler immediately to avoid repeated firing.
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(_handle[0], "WINDOW")
+            except Exception:
+                pass
+
+            try:
+                import gpu
+                import numpy as np
+
+                w, h = area.width, area.height
+                fb = gpu.state.active_framebuffer_get()
+                buf = fb.read_color(area.x, area.y, w, h, 4, 0, "UBYTE")
+
+                # Preserve aspect ratio when scaling.
+                if w >= h:
+                    new_w = resolution
+                    new_h = max(1, int(resolution * h / w))
+                else:
+                    new_h = resolution
+                    new_w = max(1, int(resolution * w / h))
+
+                img = bpy.data.images.new(
+                    "_mcp_capture_tmp", width=w, height=h, alpha=True
+                )
+                try:
+                    pixels_f32 = (
+                        np.frombuffer(bytes(buf), dtype=np.uint8).astype(np.float32)
+                        / 255.0
+                    )
+                    img.pixels.foreach_set(pixels_f32)
+                    if (new_w, new_h) != (w, h):
+                        img.scale(new_w, new_h)
+                    img.filepath_raw = output_path
+                    img.file_format = "PNG"
+                    img.save()
+                finally:
+                    bpy.data.images.remove(img)
+
+                if os.path.exists(output_path):
+                    future.set_result(
+                        success(
+                            path=output_path,
+                            file_size_bytes=os.path.getsize(output_path),
+                        )
+                    )
+                else:
+                    future.set_result(
+                        error(
+                            "CaptureError", "Draw handler ran but file was not created."
+                        )
+                    )
+            except Exception as exc:
+                future.set_result(error("CaptureError", str(exc)))
+
+        _handle = [None]
+        _handle[0] = bpy.types.SpaceView3D.draw_handler_add(
+            draw_callback, (), "WINDOW", "POST_PIXEL"
+        )
+        area.tag_redraw()
+
+    return PendingResult(setup_capture)
+
+
 def register(mcp) -> None:
     """Register viewport tools."""
 
     @mcp.tool()
     def capture_viewport(output_path: str, resolution: int = 1920) -> dict:
-        """Render the active 3D viewport to a PNG file at the given path.
+        """Capture the active 3D viewport to a PNG file.
 
-        Returns the absolute path of the saved file.
-        resolution sets the longer edge; aspect ratio is preserved from the scene render settings.
+        Uses a GPU POST_PIXEL draw handler — works even though bpy operators
+        cannot be called from background threads.  resolution sets the longer
+        edge; viewport aspect ratio is preserved.  Returns the absolute path
+        and file size of the saved PNG.
         """
+        import concurrent.futures
+        from blender_mcp import get_queue
+
+        q = get_queue()
+        if q is None:
+            return error(
+                "ServerError", "Execution queue not available — is the server running?"
+            )
+
         window, area, space, region = _get_3d_view_context()
         if area is None:
             return _HEADLESS_ERROR
 
-        import os
-
-        scene = bpy.context.scene
-        orig_x = scene.render.resolution_x
-        orig_y = scene.render.resolution_y
-        orig_pct = scene.render.resolution_percentage
-        orig_path = scene.render.filepath
-        orig_fmt = scene.render.image_settings.file_format
-
-        scene.render.resolution_x = resolution
-        scene.render.resolution_y = (
-            int(resolution * orig_y / orig_x) if orig_x else resolution
-        )
-        scene.render.resolution_percentage = 100
-        scene.render.filepath = output_path
-        scene.render.image_settings.file_format = "PNG"
-
+        # Submit the draw-handler setup to the main thread via the queue.
+        # _make_capture_pending returns a PendingResult; drain() will call
+        # setup_fn(future) which registers the handler and tags a redraw.
+        # This HTTP thread then blocks on future.result() until the next
+        # draw cycle resolves it.
+        future = q.submit(lambda: _make_capture_pending(output_path, resolution, area))
         try:
-            with bpy.context.temp_override(window=window, area=area, region=region):
-                bpy.ops.render.opengl(write_still=True)
-        except Exception as exc:
-            return error("CaptureError", str(exc))
-        finally:
-            scene.render.resolution_x = orig_x
-            scene.render.resolution_y = orig_y
-            scene.render.resolution_percentage = orig_pct
-            scene.render.filepath = orig_path
-            scene.render.image_settings.file_format = orig_fmt
-
-        if os.path.exists(output_path):
-            return success(
-                path=output_path, file_size_bytes=os.path.getsize(output_path)
-            )
-        return error(
-            "CaptureError", "Render completed but output file was not created."
-        )
+            return future.result(timeout=15)
+        except concurrent.futures.TimeoutError:
+            return error("CaptureError", "Viewport capture timed out after 15 s.")
 
     @mcp.tool()
     def set_viewport_shading(mode: str = "SOLID") -> dict:
