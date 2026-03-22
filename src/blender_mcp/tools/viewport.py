@@ -52,28 +52,42 @@ def register(mcp) -> None:
         if area is None:
             return _HEADLESS_ERROR
 
-        # Save scene render resolution so we can restore it
+        import os
+
         scene = bpy.context.scene
         orig_x = scene.render.resolution_x
         orig_y = scene.render.resolution_y
         orig_pct = scene.render.resolution_percentage
+        orig_path = scene.render.filepath
+        orig_fmt = scene.render.image_settings.file_format
 
-        # Set resolution
         scene.render.resolution_x = resolution
-        scene.render.resolution_y = resolution
+        scene.render.resolution_y = (
+            int(resolution * orig_y / orig_x) if orig_x else resolution
+        )
         scene.render.resolution_percentage = 100
+        scene.render.filepath = output_path
+        scene.render.image_settings.file_format = "PNG"
 
         try:
             with bpy.context.temp_override(window=window, area=area, region=region):
-                bpy.ops.screen.screenshot_area(filepath=output_path)
+                bpy.ops.render.opengl(write_still=True)
         except Exception as exc:
             return error("CaptureError", str(exc))
         finally:
             scene.render.resolution_x = orig_x
             scene.render.resolution_y = orig_y
             scene.render.resolution_percentage = orig_pct
+            scene.render.filepath = orig_path
+            scene.render.image_settings.file_format = orig_fmt
 
-        return success(path=output_path)
+        if os.path.exists(output_path):
+            return success(
+                path=output_path, file_size_bytes=os.path.getsize(output_path)
+            )
+        return error(
+            "CaptureError", "Render completed but output file was not created."
+        )
 
     @mcp.tool()
     def set_viewport_shading(mode: str = "SOLID") -> dict:
