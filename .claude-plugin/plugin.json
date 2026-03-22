@@ -1,0 +1,18 @@
+{
+  "name": "blender-mcp",
+  "version": "0.1.0",
+  "description": "MCP server + agents/skills for Blender 5.1+ — scene management, mesh operations, import/export, and photogrammetry terrain processing.",
+  "author": {
+    "name": "Mike Jenkins",
+    "url": "https://github.com/jenkinsm13"
+  },
+  "repository": "https://github.com/jenkinsm13/blender-mcp",
+  "license": "MIT",
+  "keywords": ["blender", "3d", "photogrammetry", "terrain", "mcp"],
+  "mcpServers": {
+    "blender-mcp": {
+      "command": "uv",
+      "args": ["run", "--directory", "${CLAUDE_PLUGIN_ROOT}", "blender-mcp"]
+    }
+  }
+}
