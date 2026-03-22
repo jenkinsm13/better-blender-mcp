@@ -15,8 +15,8 @@ _VALID_SHADING_MODES = {"SOLID", "WIREFRAME", "MATERIAL", "RENDERED"}
 def _get_3d_view_context():
     """Return (window, area, space, region) for the first VIEW_3D found, or Nones.
 
-    Works from timer context where bpy.context.screen is None by walking
-    bpy.context.window_manager.windows instead.
+    Works from any thread by walking bpy.context.window_manager.windows
+    (bpy.context.screen is None on background threads).
     """
     for window in bpy.context.window_manager.windows:
         screen = window.screen
@@ -39,86 +39,43 @@ def _get_3d_view_context():
     return None, None, None, None
 
 
-def _make_capture_pending(output_path: str, resolution: int, area):
-    """Return a PendingResult that captures the viewport via a POST_PIXEL draw handler.
+def _capture_on_main_thread(output_path: str, resolution: int) -> dict:
+    """Take a viewport screenshot on the main thread.
 
-    Called on the main thread (from queue.drain).  The draw handler fires during
-    the very next Blender draw cycle when GPU context IS active, reads the
-    framebuffer, writes a PNG, then resolves the future the HTTP thread is
-    waiting on.
+    Uses bpy.ops.screen.screenshot_area (the same approach as the community
+    Blender MCP).  Must run on the main thread where bpy.context has full
+    state — call via ExecutionQueue.submit().
     """
-    from blender_mcp.queue import PendingResult
+    # Find VIEW_3D — on main thread bpy.context.screen is available but we
+    # use the same window_manager walk for consistency.
+    window, area, space, region = _get_3d_view_context()
+    if area is None:
+        return _HEADLESS_ERROR
 
-    def setup_capture(future) -> None:
-        _done = [False]  # guard: only fire once
+    with bpy.context.temp_override(window=window, area=area):
+        bpy.ops.screen.screenshot_area(filepath=output_path)
 
-        def draw_callback() -> None:
-            if _done[0]:
-                return
-            _done[0] = True
+    if not os.path.exists(output_path):
+        return error("CaptureError", "screenshot_area ran but file was not created.")
 
-            # Remove handler immediately to avoid repeated firing.
-            try:
-                bpy.types.SpaceView3D.draw_handler_remove(_handle[0], "WINDOW")
-            except Exception:
-                pass
+    # Resize if needed (screenshot_area captures at native viewport size).
+    img = bpy.data.images.load(output_path)
+    try:
+        w, h = img.size
+        if max(w, h) > resolution:
+            scale = resolution / max(w, h)
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            img.scale(new_w, new_h)
+            img.file_format = "PNG"
+            img.save()
+    finally:
+        bpy.data.images.remove(img)
 
-            try:
-                import gpu
-                import numpy as np
-
-                w, h = area.width, area.height
-                fb = gpu.state.active_framebuffer_get()
-                buf = fb.read_color(area.x, area.y, w, h, 4, 0, "UBYTE")
-
-                # Preserve aspect ratio when scaling.
-                if w >= h:
-                    new_w = resolution
-                    new_h = max(1, int(resolution * h / w))
-                else:
-                    new_h = resolution
-                    new_w = max(1, int(resolution * w / h))
-
-                img = bpy.data.images.new(
-                    "_mcp_capture_tmp", width=w, height=h, alpha=True
-                )
-                try:
-                    pixels_f32 = (
-                        np.frombuffer(bytes(buf), dtype=np.uint8).astype(np.float32)
-                        / 255.0
-                    )
-                    img.pixels.foreach_set(pixels_f32)
-                    if (new_w, new_h) != (w, h):
-                        img.scale(new_w, new_h)
-                    img.filepath_raw = output_path
-                    img.file_format = "PNG"
-                    img.save()
-                finally:
-                    bpy.data.images.remove(img)
-
-                if os.path.exists(output_path):
-                    future.set_result(
-                        success(
-                            path=output_path,
-                            file_size_bytes=os.path.getsize(output_path),
-                        )
-                    )
-                else:
-                    future.set_result(
-                        error(
-                            "CaptureError", "Draw handler ran but file was not created."
-                        )
-                    )
-            except Exception as exc:
-                future.set_result(error("CaptureError", str(exc)))
-
-        _handle = [None]
-        _handle[0] = bpy.types.SpaceView3D.draw_handler_add(
-            draw_callback, (), "WINDOW", "POST_PIXEL"
-        )
-        area.tag_redraw()
-
-    return PendingResult(setup_capture)
+    return success(
+        path=output_path,
+        file_size_bytes=os.path.getsize(output_path),
+    )
 
 
 def register(mcp) -> None:
@@ -126,32 +83,24 @@ def register(mcp) -> None:
 
     @mcp.tool()
     def capture_viewport(output_path: str, resolution: int = 1920) -> dict:
-        """Capture the active 3D viewport to a PNG file.
+        """Render the active 3D viewport to a PNG file at the given path.
 
-        Uses a GPU POST_PIXEL draw handler — works even though bpy operators
-        cannot be called from background threads.  resolution sets the longer
-        edge; viewport aspect ratio is preserved.  Returns the absolute path
-        and file size of the saved PNG.
+        Returns the absolute path of the saved file.
+        resolution sets the longer edge; aspect ratio is preserved.
         """
         import concurrent.futures
-        from blender_mcp import get_queue
+        import blender_mcp
 
-        q = get_queue()
+        q = blender_mcp._queue
         if q is None:
             return error(
-                "ServerError", "Execution queue not available — is the server running?"
+                "ServerError",
+                "Execution queue not available — is the server running?",
             )
 
-        window, area, space, region = _get_3d_view_context()
-        if area is None:
-            return _HEADLESS_ERROR
-
-        # Submit the draw-handler setup to the main thread via the queue.
-        # _make_capture_pending returns a PendingResult; drain() will call
-        # setup_fn(future) which registers the handler and tags a redraw.
-        # This HTTP thread then blocks on future.result() until the next
-        # draw cycle resolves it.
-        future = q.submit(lambda: _make_capture_pending(output_path, resolution, area))
+        # Route through queue so the capture runs on the main thread where
+        # bpy.context has full state and operators work.
+        future = q.submit(lambda: _capture_on_main_thread(output_path, resolution))
         try:
             return future.result(timeout=15)
         except concurrent.futures.TimeoutError:

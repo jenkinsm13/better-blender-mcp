@@ -23,6 +23,21 @@ def get_queue():
     return _queue
 
 
+def _purge_submodules():
+    """Remove all blender_mcp.* submodules from sys.modules.
+
+    This forces Python to reimport from disk on the next ``from blender_mcp.x
+    import y``, ensuring Stop→Start always picks up code changes without
+    restarting Blender.  The top-level ``blender_mcp`` package is kept because
+    it owns the addon registration and timer state.
+    """
+    import sys
+
+    to_purge = [k for k in sys.modules if k.startswith("blender_mcp.")]
+    for k in to_purge:
+        del sys.modules[k]
+
+
 def _timer_callback():
     """Drain execution queue on main thread. Called by bpy.app.timers."""
     if _queue is not None:
@@ -41,6 +56,10 @@ def _register_blender_classes():
 
         def execute(self, context):
             global _server_thread, _queue
+
+            # Purge cached submodules so Start always picks up on-disk code.
+            _purge_submodules()
+
             from blender_mcp.queue import ExecutionQueue
             from blender_mcp.server import start_background
 
@@ -72,6 +91,10 @@ def _register_blender_classes():
 
             _server_thread = None
             _queue = None
+
+            # Purge cached submodules so next Start loads fresh code.
+            _purge_submodules()
+
             return {"FINISHED"}
 
     class BLENDERMCP_PT_panel(bpy.types.Panel):
