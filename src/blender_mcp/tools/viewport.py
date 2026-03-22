@@ -1,6 +1,12 @@
-"""Viewport tools for Blender MCP."""
+"""Viewport tools for Blender MCP.
+
+All tools in this module are wrapped by MainThreadMCP so they run on
+Blender's main thread where bpy.context has full state (screen, area, etc.)
+and bpy.ops calls work correctly.
+"""
 
 import os
+import tempfile
 import bpy
 from blender_mcp.utils.responses import success, error
 
@@ -10,6 +16,9 @@ _HEADLESS_ERROR = error(
 )
 
 _VALID_SHADING_MODES = {"SOLID", "WIREFRAME", "MATERIAL", "RENDERED"}
+
+# Default 4-pack: classic CAD quad view + user's current perspective.
+_DEFAULT_4PACK = ["TOP", "FRONT", "RIGHT", "PERSPECTIVE"]
 
 
 def _get_3d_view_context():
@@ -39,43 +48,36 @@ def _get_3d_view_context():
     return None, None, None, None
 
 
-def _capture_on_main_thread(output_path: str, resolution: int) -> dict:
-    """Take a viewport screenshot on the main thread.
+def _stitch_2x2(paths, output_path):
+    """Stitch 4 PNG files into a 2x2 grid and save to output_path."""
+    import numpy as np
 
-    Uses bpy.ops.screen.screenshot_area (the same approach as the community
-    Blender MCP).  Must run on the main thread where bpy.context has full
-    state — call via ExecutionQueue.submit().
-    """
-    # Find VIEW_3D — on main thread bpy.context.screen is available but we
-    # use the same window_manager walk for consistency.
-    window, area, space, region = _get_3d_view_context()
-    if area is None:
-        return _HEADLESS_ERROR
+    imgs = [bpy.data.images.load(p) for p in paths]
+    w, h = imgs[0].size
 
-    with bpy.context.temp_override(window=window, area=area):
-        bpy.ops.screen.screenshot_area(filepath=output_path)
+    out_w, out_h = 2 * w, 2 * h
+    out_pixels = np.zeros(out_h * out_w * 4, dtype=np.float32)
+    out_2d = out_pixels.reshape(out_h, out_w, 4)
 
-    if not os.path.exists(output_path):
-        return error("CaptureError", "screenshot_area ran but file was not created.")
+    # Blender pixel layout is bottom-up:
+    #   row=1 (high y) = visual top row    → views[0], views[1]
+    #   row=0 (low y)  = visual bottom row → views[2], views[3]
+    positions = [(1, 0), (1, 1), (0, 0), (0, 1)]
 
-    # Resize if needed (screenshot_area captures at native viewport size).
-    img = bpy.data.images.load(output_path)
-    try:
-        w, h = img.size
-        if max(w, h) > resolution:
-            scale = resolution / max(w, h)
-            new_w = max(1, int(w * scale))
-            new_h = max(1, int(h * scale))
-            img.scale(new_w, new_h)
-            img.file_format = "PNG"
-            img.save()
-    finally:
+    for img, (row, col) in zip(imgs, positions):
+        px = np.empty(w * h * 4, dtype=np.float32)
+        img.pixels.foreach_get(px)
+        out_2d[row * h : (row + 1) * h, col * w : (col + 1) * w] = px.reshape(h, w, 4)
         bpy.data.images.remove(img)
 
-    return success(
-        path=output_path,
-        file_size_bytes=os.path.getsize(output_path),
-    )
+    out_img = bpy.data.images.new("_4pack_tmp", width=out_w, height=out_h, alpha=True)
+    try:
+        out_img.pixels.foreach_set(out_pixels)
+        out_img.filepath_raw = output_path
+        out_img.file_format = "PNG"
+        out_img.save()
+    finally:
+        bpy.data.images.remove(out_img)
 
 
 def register(mcp) -> None:
@@ -88,23 +90,135 @@ def register(mcp) -> None:
         Returns the absolute path of the saved file.
         resolution sets the longer edge; aspect ratio is preserved.
         """
-        import concurrent.futures
-        import blender_mcp
+        window, area, space, region = _get_3d_view_context()
+        if area is None:
+            return _HEADLESS_ERROR
 
-        q = blender_mcp._queue
-        if q is None:
+        with bpy.context.temp_override(window=window, area=area):
+            bpy.ops.screen.screenshot_area(filepath=output_path)
+
+        if not os.path.exists(output_path):
             return error(
-                "ServerError",
-                "Execution queue not available — is the server running?",
+                "CaptureError", "screenshot_area ran but file was not created."
             )
 
-        # Route through queue so the capture runs on the main thread where
-        # bpy.context has full state and operators work.
-        future = q.submit(lambda: _capture_on_main_thread(output_path, resolution))
+        # Resize if needed (screenshot_area captures at native viewport size).
+        img = bpy.data.images.load(output_path)
         try:
-            return future.result(timeout=15)
-        except concurrent.futures.TimeoutError:
-            return error("CaptureError", "Viewport capture timed out after 15 s.")
+            w, h = img.size
+            if max(w, h) > resolution:
+                scale = resolution / max(w, h)
+                img.scale(max(1, int(w * scale)), max(1, int(h * scale)))
+                img.file_format = "PNG"
+                img.save()
+        finally:
+            bpy.data.images.remove(img)
+
+        return success(
+            path=output_path,
+            file_size_bytes=os.path.getsize(output_path),
+        )
+
+    @mcp.tool()
+    def capture_viewport_4pack(output_path: str, resolution: int = 2048) -> dict:
+        """Capture Top, Front, Right, and Perspective views stitched into a 2x2 grid.
+
+        Each quadrant is rendered at resolution/2 × resolution/2 using OpenGL
+        viewport rendering, then combined into a single PNG.  The perspective
+        quadrant preserves the user's current view angle.
+
+        Layout:
+            ┌───────┬───────┐
+            │  TOP  │ FRONT │
+            ├───────┼───────┤
+            │ RIGHT │ PERSP │
+            └───────┴───────┘
+        """
+        window, area, space, region = _get_3d_view_context()
+        if area is None:
+            return _HEADLESS_ERROR
+
+        region_3d = space.region_3d
+        scene = bpy.context.scene
+        quad_res = resolution // 2
+
+        # ── Save state ──────────────────────────────────────────────
+        orig_rotation = region_3d.view_rotation.copy()
+        orig_location = region_3d.view_location.copy()
+        orig_distance = region_3d.view_distance
+        orig_perspective = region_3d.view_perspective
+        orig_rx = scene.render.resolution_x
+        orig_ry = scene.render.resolution_y
+        orig_pct = scene.render.resolution_percentage
+        orig_path = scene.render.filepath
+        orig_fmt = scene.render.image_settings.file_format
+        smooth = bpy.context.preferences.view.smooth_view
+
+        # Disable smooth-view so view_axis snaps instantly.
+        bpy.context.preferences.view.smooth_view = 0
+
+        # Set render resolution for OpenGL viewport render.
+        scene.render.resolution_x = quad_res
+        scene.render.resolution_y = quad_res
+        scene.render.resolution_percentage = 100
+        scene.render.image_settings.file_format = "PNG"
+
+        temp_dir = tempfile.gettempdir()
+        temp_paths = []
+        views = _DEFAULT_4PACK
+
+        try:
+            for i, view_name in enumerate(views):
+                temp_path = os.path.join(temp_dir, f"_mcp_4pack_{i}.png")
+                scene.render.filepath = temp_path
+
+                if view_name == "PERSPECTIVE":
+                    # Restore original view for the perspective capture.
+                    region_3d.view_rotation = orig_rotation.copy()
+                    region_3d.view_location = orig_location.copy()
+                    region_3d.view_distance = orig_distance
+                    region_3d.view_perspective = "PERSP"
+                else:
+                    with bpy.context.temp_override(
+                        window=window, area=area, region=region
+                    ):
+                        bpy.ops.view3d.view_axis(type=view_name)
+
+                # render.opengl does its own rendering pass — no redraw needed.
+                with bpy.context.temp_override(window=window, area=area, region=region):
+                    bpy.ops.render.opengl(write_still=True, view_context=True)
+
+                temp_paths.append(temp_path)
+
+            # Stitch into 2x2 grid.
+            _stitch_2x2(temp_paths, output_path)
+
+        finally:
+            # ── Restore state ───────────────────────────────────────
+            region_3d.view_rotation = orig_rotation
+            region_3d.view_location = orig_location
+            region_3d.view_distance = orig_distance
+            region_3d.view_perspective = orig_perspective
+            scene.render.resolution_x = orig_rx
+            scene.render.resolution_y = orig_ry
+            scene.render.resolution_percentage = orig_pct
+            scene.render.filepath = orig_path
+            scene.render.image_settings.file_format = orig_fmt
+            bpy.context.preferences.view.smooth_view = smooth
+
+            # Cleanup temp files.
+            for p in temp_paths:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+        return success(
+            path=output_path,
+            file_size_bytes=os.path.getsize(output_path),
+            views=views,
+            quadrant_resolution=quad_res,
+        )
 
     @mcp.tool()
     def set_viewport_shading(mode: str = "SOLID") -> dict:
