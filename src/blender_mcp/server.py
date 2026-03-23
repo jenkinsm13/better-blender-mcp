@@ -102,10 +102,16 @@ def start_background(port: int | None = None) -> threading.Thread:
     _last_mcp = mcp
     mcp._port = actual_port  # Track port for double-start detection
 
-    thread = threading.Thread(
-        target=lambda: mcp.run(transport="streamable-http"),
-        daemon=True,
-    )
+    def _run_server():
+        try:
+            mcp.run(transport="streamable-http")
+        except Exception as exc:
+            print(f"[BlenderMCP] Server crashed: {exc}", file=sys.stderr)
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+
+    thread = threading.Thread(target=_run_server, daemon=True)
     thread.start()
     _last_thread = thread
 
