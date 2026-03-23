@@ -164,11 +164,22 @@ def register(mcp) -> None:
         views = _DEFAULT_4PACK
 
         try:
-            # Select mesh objects so view_selected frames geometry, not
-            # distant cameras/lights that make the viewport zoom out.
-            orig_selection = [o for o in scene.objects if o.select_get()]
+            # Compute bounding box of all mesh objects for manual framing.
+            from mathutils import Vector
+
+            bbox_min = Vector((float("inf"),) * 3)
+            bbox_max = Vector((float("-inf"),) * 3)
             for obj in scene.objects:
-                obj.select_set(obj.type == "MESH")
+                if obj.type == "MESH":
+                    for corner in obj.bound_box:
+                        wc = obj.matrix_world @ Vector(corner)
+                        bbox_min = Vector(min(a, b) for a, b in zip(bbox_min, wc))
+                        bbox_max = Vector(max(a, b) for a, b in zip(bbox_max, wc))
+
+            bbox_center = (bbox_min + bbox_max) / 2
+            bbox_size = (bbox_max - bbox_min).length
+            # Pad so geometry doesn't touch the edges.
+            frame_distance = bbox_size * 1.2 if bbox_size > 0 else 10.0
 
             for i, view_name in enumerate(views):
                 temp_path = os.path.join(temp_dir, f"_mcp_4pack_{i}.png")
@@ -185,7 +196,9 @@ def register(mcp) -> None:
                         window=window, area=area, region=region
                     ):
                         bpy.ops.view3d.view_axis(type=view_name)
-                        bpy.ops.view3d.view_selected()
+                    # Directly set view center and zoom — instant, no deferred update.
+                    region_3d.view_location = bbox_center.copy()
+                    region_3d.view_distance = frame_distance
 
                 # render.opengl does its own rendering pass — no redraw needed.
                 with bpy.context.temp_override(window=window, area=area, region=region):
@@ -208,10 +221,6 @@ def register(mcp) -> None:
             scene.render.filepath = orig_path
             scene.render.image_settings.file_format = orig_fmt
             bpy.context.preferences.view.smooth_view = smooth
-
-            # Restore original selection.
-            for obj in scene.objects:
-                obj.select_set(obj in orig_selection)
 
             # Cleanup temp files.
             for p in temp_paths:
