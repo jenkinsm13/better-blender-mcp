@@ -179,6 +179,8 @@ def register(mcp) -> None:
                         window=window, area=area, region=region
                     ):
                         bpy.ops.view3d.view_axis(type=view_name)
+                        # Frame all objects so they fill the viewport.
+                        bpy.ops.view3d.view_all(center=False)
 
                 # render.opengl does its own rendering pass — no redraw needed.
                 with bpy.context.temp_override(window=window, area=area, region=region):
