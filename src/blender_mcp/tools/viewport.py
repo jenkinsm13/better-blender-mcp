@@ -164,6 +164,12 @@ def register(mcp) -> None:
         views = _DEFAULT_4PACK
 
         try:
+            # Select mesh objects so view_selected frames geometry, not
+            # distant cameras/lights that make the viewport zoom out.
+            orig_selection = [o for o in scene.objects if o.select_get()]
+            for obj in scene.objects:
+                obj.select_set(obj.type == "MESH")
+
             for i, view_name in enumerate(views):
                 temp_path = os.path.join(temp_dir, f"_mcp_4pack_{i}.png")
                 scene.render.filepath = temp_path
@@ -179,8 +185,7 @@ def register(mcp) -> None:
                         window=window, area=area, region=region
                     ):
                         bpy.ops.view3d.view_axis(type=view_name)
-                        # Frame all objects so they fill the viewport.
-                        bpy.ops.view3d.view_all(center=False)
+                        bpy.ops.view3d.view_selected()
 
                 # render.opengl does its own rendering pass — no redraw needed.
                 with bpy.context.temp_override(window=window, area=area, region=region):
@@ -203,6 +208,10 @@ def register(mcp) -> None:
             scene.render.filepath = orig_path
             scene.render.image_settings.file_format = orig_fmt
             bpy.context.preferences.view.smooth_view = smooth
+
+            # Restore original selection.
+            for obj in scene.objects:
+                obj.select_set(obj in orig_selection)
 
             # Cleanup temp files.
             for p in temp_paths:
