@@ -48,27 +48,37 @@ def _get_3d_view_context():
     return None, None, None, None
 
 
-def _stitch_2x2(paths, output_path):
-    """Stitch 4 PNG files into a 2x2 grid and save to output_path."""
+def _stitch_2x2(paths, output_path, quad_res):
+    """Stitch 4 PNG files into a 2x2 grid and save to output_path.
+
+    Each image is resized to quad_res x quad_res before stitching so
+    the final output is exactly 2*quad_res x 2*quad_res regardless of
+    the original viewport dimensions.
+    """
     import numpy as np
 
-    imgs = [bpy.data.images.load(p) for p in paths]
-    w, h = imgs[0].size
-
-    out_w, out_h = 2 * w, 2 * h
+    tile_w, tile_h = quad_res, quad_res
+    out_w, out_h = 2 * tile_w, 2 * tile_h
     out_pixels = np.zeros(out_h * out_w * 4, dtype=np.float32)
     out_2d = out_pixels.reshape(out_h, out_w, 4)
 
     # Blender pixel layout is bottom-up:
-    #   row=1 (high y) = visual top row    → views[0], views[1]
-    #   row=0 (low y)  = visual bottom row → views[2], views[3]
+    #   row=1 (high y) = visual top row    -> views[0], views[1]
+    #   row=0 (low y)  = visual bottom row -> views[2], views[3]
     positions = [(1, 0), (1, 1), (0, 0), (0, 1)]
 
-    for img, (row, col) in zip(imgs, positions):
-        px = np.empty(w * h * 4, dtype=np.float32)
-        img.pixels.foreach_get(px)
-        out_2d[row * h : (row + 1) * h, col * w : (col + 1) * w] = px.reshape(h, w, 4)
-        bpy.data.images.remove(img)
+    for path, (row, col) in zip(paths, positions):
+        img = bpy.data.images.load(path)
+        try:
+            img.scale(tile_w, tile_h)
+            px = np.empty(tile_w * tile_h * 4, dtype=np.float32)
+            img.pixels.foreach_get(px)
+            out_2d[
+                row * tile_h : (row + 1) * tile_h,
+                col * tile_w : (col + 1) * tile_w,
+            ] = px.reshape(tile_h, tile_w, 4)
+        finally:
+            bpy.data.images.remove(img)
 
     out_img = bpy.data.images.new("_4pack_tmp", width=out_w, height=out_h, alpha=True)
     try:
@@ -143,21 +153,10 @@ def register(mcp) -> None:
         orig_location = region_3d.view_location.copy()
         orig_distance = region_3d.view_distance
         orig_perspective = region_3d.view_perspective
-        orig_rx = scene.render.resolution_x
-        orig_ry = scene.render.resolution_y
-        orig_pct = scene.render.resolution_percentage
-        orig_path = scene.render.filepath
-        orig_fmt = scene.render.image_settings.file_format
         smooth = bpy.context.preferences.view.smooth_view
 
         # Disable smooth-view so view_axis snaps instantly.
         bpy.context.preferences.view.smooth_view = 0
-
-        # Set render resolution for OpenGL viewport render.
-        scene.render.resolution_x = quad_res
-        scene.render.resolution_y = quad_res
-        scene.render.resolution_percentage = 100
-        scene.render.image_settings.file_format = "PNG"
 
         temp_dir = tempfile.gettempdir()
         temp_paths = []
@@ -183,7 +182,6 @@ def register(mcp) -> None:
 
             for i, view_name in enumerate(views):
                 temp_path = os.path.join(temp_dir, f"_mcp_4pack_{i}.png")
-                scene.render.filepath = temp_path
 
                 if view_name == "PERSPECTIVE":
                     # Restore original view for the perspective capture.
@@ -200,14 +198,17 @@ def register(mcp) -> None:
                     region_3d.view_location = bbox_center.copy()
                     region_3d.view_distance = frame_distance
 
-                # render.opengl does its own rendering pass — no redraw needed.
+                # Force a redraw so the viewport reflects the new view state,
+                # then capture the freshly drawn buffer with screenshot_area.
                 with bpy.context.temp_override(window=window, area=area, region=region):
-                    bpy.ops.render.opengl(write_still=True, view_context=True)
+                    bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
+                with bpy.context.temp_override(window=window, area=area):
+                    bpy.ops.screen.screenshot_area(filepath=temp_path)
 
                 temp_paths.append(temp_path)
 
-            # Stitch into 2x2 grid.
-            _stitch_2x2(temp_paths, output_path)
+            # Stitch into 2x2 grid, resizing each to quad_res.
+            _stitch_2x2(temp_paths, output_path, quad_res)
 
         finally:
             # ── Restore state ───────────────────────────────────────
@@ -215,11 +216,6 @@ def register(mcp) -> None:
             region_3d.view_location = orig_location
             region_3d.view_distance = orig_distance
             region_3d.view_perspective = orig_perspective
-            scene.render.resolution_x = orig_rx
-            scene.render.resolution_y = orig_ry
-            scene.render.resolution_percentage = orig_pct
-            scene.render.filepath = orig_path
-            scene.render.image_settings.file_format = orig_fmt
             bpy.context.preferences.view.smooth_view = smooth
 
             # Cleanup temp files.
