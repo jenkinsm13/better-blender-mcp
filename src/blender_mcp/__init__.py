@@ -55,10 +55,25 @@ def _register_blender_classes():
         bl_label = "Start MCP Server"
 
         def execute(self, context):
+            import time
+
             global _server_thread, _queue
 
-            # Purge cached submodules so Start always picks up on-disk code.
+            # If a previous server is still alive, shut it down first.
+            try:
+                from blender_mcp.server import _last_mcp, _last_thread
+
+                if _last_mcp:
+                    _last_mcp.shutdown()
+                if _last_thread and _last_thread.is_alive():
+                    _last_thread.join(timeout=2.0)
+            except Exception:
+                pass
+
+            # Purge cached submodules AFTER the old server is dead so we
+            # don't yank modules out from under a running thread.
             _purge_submodules()
+            time.sleep(0.3)  # let the OS release the port
 
             from blender_mcp.queue import ExecutionQueue
             from blender_mcp.server import start_background
@@ -91,10 +106,6 @@ def _register_blender_classes():
 
             _server_thread = None
             _queue = None
-
-            # Purge cached submodules so next Start loads fresh code.
-            _purge_submodules()
-
             return {"FINISHED"}
 
     class BLENDERMCP_PT_panel(bpy.types.Panel):
